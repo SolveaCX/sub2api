@@ -2046,6 +2046,57 @@ func TestOpenAIAccountRuntimeStats_ReportAndSnapshot(t *testing.T) {
 	require.Equal(t, 1, stats.size())
 }
 
+func TestOpenAIAccountLoadPlan_DeprioritizesSlowTTFTAccountWithoutDisablingIt(t *testing.T) {
+	stats := newOpenAIAccountRuntimeStats()
+	slowTTFT := 20000
+	stats.report(6101, true, &slowTTFT)
+
+	cfg := &config.Config{}
+	cfg.Gateway.OpenAIWS.LBTopK = 2
+	cfg.Gateway.OpenAIWS.SchedulerScoreWeights.TTFT = 1
+	cfg.Gateway.OpenAIScheduler.StickyEscapeTTFTMs = 15000
+
+	scheduler := &defaultOpenAIAccountScheduler{
+		service: &OpenAIGatewayService{cfg: cfg},
+		stats:   stats,
+	}
+	accounts := []*Account{
+		{ID: 6101, Priority: 0},
+		{ID: 6102, Priority: 0},
+		{ID: 6103, Priority: 0},
+	}
+	loadMap := map[int64]*AccountLoadInfo{
+		6101: {AccountID: 6101, LoadRate: 0, WaitingCount: 0},
+		6102: {AccountID: 6102, LoadRate: 0, WaitingCount: 0},
+		6103: {AccountID: 6103, LoadRate: 0, WaitingCount: 0},
+	}
+
+	smallPlan := scheduler.buildOpenAIAccountLoadPlan(OpenAIAccountScheduleRequest{
+		RequestedModel:   "gpt-5.1",
+		RequestSizeBytes: 1024,
+	}, accounts, loadMap)
+	require.Len(t, smallPlan.candidates, 3)
+
+	smallScoreByAccountID := make(map[int64]float64, len(smallPlan.candidates))
+	for _, candidate := range smallPlan.candidates {
+		smallScoreByAccountID[candidate.account.ID] = candidate.score
+	}
+	require.Greater(t, smallScoreByAccountID[int64(6101)], 0.0)
+	require.Less(t, smallScoreByAccountID[int64(6101)], smallScoreByAccountID[int64(6102)])
+	require.Less(t, smallScoreByAccountID[int64(6101)], smallScoreByAccountID[int64(6103)])
+
+	largePlan := scheduler.buildOpenAIAccountLoadPlan(OpenAIAccountScheduleRequest{
+		RequestedModel:   "gpt-5.1",
+		RequestSizeBytes: openAIAccountLargeRequestBytes,
+	}, accounts, loadMap)
+	scoreByAccountID := make(map[int64]float64, len(largePlan.candidates))
+	for _, candidate := range largePlan.candidates {
+		scoreByAccountID[candidate.account.ID] = candidate.score
+	}
+	require.Greater(t, scoreByAccountID[int64(6101)], 0.0)
+	require.Less(t, scoreByAccountID[int64(6101)], smallScoreByAccountID[int64(6101)])
+}
+
 func TestOpenAIAccountRuntimeStats_ReportConcurrent(t *testing.T) {
 	stats := newOpenAIAccountRuntimeStats()
 

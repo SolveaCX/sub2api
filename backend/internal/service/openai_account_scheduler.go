@@ -25,6 +25,14 @@ const (
 )
 
 const (
+	openAIAccountLargeRequestBytes      = 64 * 1024
+	openAIAccountSlowTTFTSmallFactor    = 0.35
+	openAIAccountSlowTTFTLargeFactor    = 0.15
+	openAIAccountUnknownTTFTScoreFactor = 0.5
+	openAIAccountDefaultSlowTTFTMs      = 15000
+)
+
+const (
 	openAIAdvancedSchedulerSettingCacheTTL  = 5 * time.Second
 	openAIAdvancedSchedulerSettingDBTimeout = 2 * time.Second
 )
@@ -56,6 +64,7 @@ type OpenAIAccountScheduleRequest struct {
 	RequiredImageCapability OpenAIImagesCapability
 	RequireCompact          bool
 	ExcludedIDs             map[int64]struct{}
+	RequestSizeBytes        int
 }
 
 type OpenAIAccountScheduleDecision struct {
@@ -558,6 +567,27 @@ func selectTopKOpenAICandidates(candidates []openAIAccountCandidateScore, topK i
 	return ranked
 }
 
+func openAIAccountTTFTScoreFactor(item openAIAccountCandidateScore, hasTTFTSample bool, minTTFT float64, maxTTFT float64, slowTTFTMs float64, requestSizeBytes int) float64 {
+	if !item.hasTTFT || item.ttft <= 0 {
+		return openAIAccountUnknownTTFTScoreFactor
+	}
+	if slowTTFTMs <= 0 {
+		slowTTFTMs = openAIAccountDefaultSlowTTFTMs
+	}
+	factor := openAIAccountUnknownTTFTScoreFactor
+	if hasTTFTSample && maxTTFT > minTTFT {
+		factor = 1 - clamp01((item.ttft-minTTFT)/(maxTTFT-minTTFT))
+	}
+	if item.ttft > slowTTFTMs {
+		slowFactor := openAIAccountSlowTTFTSmallFactor
+		if requestSizeBytes >= openAIAccountLargeRequestBytes {
+			slowFactor = openAIAccountSlowTTFTLargeFactor
+		}
+		return math.Min(factor, slowFactor)
+	}
+	return factor
+}
+
 type openAISelectionRNG struct {
 	state uint64
 }
@@ -752,6 +782,7 @@ func (s *defaultOpenAIAccountScheduler) buildOpenAIAccountLoadPlan(
 	plan.loadSkew = calcLoadSkewByMoments(loadRateSum, loadRateSumSquares, len(candidates))
 
 	weights := s.service.openAIWSSchedulerWeights()
+	slowTTFTMs := s.service.openAIStickyEscapeConfig().ttftMs
 
 	// Reset 因子（use-it-or-lose-it）：在拥有「未来会话窗口结束时间」的账号中，
 	// 剩余时间越短 → 因子越接近 1（越早重置越优先用尽）。无活跃窗口的账号因子为 0。
@@ -790,10 +821,7 @@ func (s *defaultOpenAIAccountScheduler) buildOpenAIAccountLoadPlan(
 		loadFactor := 1 - clamp01(float64(item.loadInfo.LoadRate)/100.0)
 		queueFactor := 1 - clamp01(float64(item.loadInfo.WaitingCount)/float64(maxWaiting))
 		errorFactor := 1 - clamp01(item.errorRate)
-		ttftFactor := 0.5
-		if item.hasTTFT && hasTTFTSample && maxTTFT > minTTFT {
-			ttftFactor = 1 - clamp01((item.ttft-minTTFT)/(maxTTFT-minTTFT))
-		}
+		ttftFactor := openAIAccountTTFTScoreFactor(*item, hasTTFTSample, minTTFT, maxTTFT, slowTTFTMs, req.RequestSizeBytes)
 		resetFactor := 0.0
 		if weights.Reset > 0 && hasResetSample {
 			if end := item.account.SessionWindowEnd; end != nil && now.Before(*end) {
@@ -1229,7 +1257,7 @@ func (s *OpenAIGatewayService) SelectAccountWithScheduler(
 	requiredTransport OpenAIUpstreamTransport,
 	requireCompact bool,
 ) (*AccountSelectionResult, OpenAIAccountScheduleDecision, error) {
-	return s.selectAccountWithScheduler(ctx, groupID, previousResponseID, sessionHash, requestedModel, excludedIDs, requiredTransport, "", "", requireCompact, PlatformOpenAI)
+	return s.selectAccountWithScheduler(ctx, groupID, previousResponseID, sessionHash, requestedModel, excludedIDs, requiredTransport, "", "", requireCompact, PlatformOpenAI, 0)
 }
 
 func (s *OpenAIGatewayService) SelectAccountWithSchedulerForCapability(
@@ -1248,7 +1276,27 @@ func (s *OpenAIGatewayService) SelectAccountWithSchedulerForCapability(
 	if len(platformOverride) > 0 {
 		platform = platformOverride[0]
 	}
-	return s.selectAccountWithScheduler(ctx, groupID, previousResponseID, sessionHash, requestedModel, excludedIDs, requiredTransport, requiredCapability, "", requireCompact, platform)
+	return s.SelectAccountWithSchedulerForCapabilityWithRequestSize(ctx, groupID, previousResponseID, sessionHash, requestedModel, excludedIDs, requiredTransport, requiredCapability, requireCompact, 0, platform)
+}
+
+func (s *OpenAIGatewayService) SelectAccountWithSchedulerForCapabilityWithRequestSize(
+	ctx context.Context,
+	groupID *int64,
+	previousResponseID string,
+	sessionHash string,
+	requestedModel string,
+	excludedIDs map[int64]struct{},
+	requiredTransport OpenAIUpstreamTransport,
+	requiredCapability OpenAIEndpointCapability,
+	requireCompact bool,
+	requestSizeBytes int,
+	platformOverride ...string,
+) (*AccountSelectionResult, OpenAIAccountScheduleDecision, error) {
+	platform := PlatformOpenAI
+	if len(platformOverride) > 0 {
+		platform = platformOverride[0]
+	}
+	return s.selectAccountWithScheduler(ctx, groupID, previousResponseID, sessionHash, requestedModel, excludedIDs, requiredTransport, requiredCapability, "", requireCompact, platform, requestSizeBytes)
 }
 
 func (s *OpenAIGatewayService) SelectAccountWithSchedulerForImages(
@@ -1259,13 +1307,13 @@ func (s *OpenAIGatewayService) SelectAccountWithSchedulerForImages(
 	excludedIDs map[int64]struct{},
 	requiredCapability OpenAIImagesCapability,
 ) (*AccountSelectionResult, OpenAIAccountScheduleDecision, error) {
-	selection, decision, err := s.selectAccountWithScheduler(ctx, groupID, "", sessionHash, requestedModel, excludedIDs, OpenAIUpstreamTransportHTTPSSE, "", requiredCapability, false, PlatformOpenAI)
+	selection, decision, err := s.selectAccountWithScheduler(ctx, groupID, "", sessionHash, requestedModel, excludedIDs, OpenAIUpstreamTransportHTTPSSE, "", requiredCapability, false, PlatformOpenAI, 0)
 	if err == nil && selection != nil && selection.Account != nil {
 		return selection, decision, nil
 	}
 	// 如果要求 native 能力（如指定了模型）但没有可用的 APIKey 账号，回退到 basic（OAuth 账号）
 	if requiredCapability == OpenAIImagesCapabilityNative {
-		return s.selectAccountWithScheduler(ctx, groupID, "", sessionHash, requestedModel, excludedIDs, OpenAIUpstreamTransportHTTPSSE, "", OpenAIImagesCapabilityBasic, false, PlatformOpenAI)
+		return s.selectAccountWithScheduler(ctx, groupID, "", sessionHash, requestedModel, excludedIDs, OpenAIUpstreamTransportHTTPSSE, "", OpenAIImagesCapabilityBasic, false, PlatformOpenAI, 0)
 	}
 	return selection, decision, err
 }
@@ -1282,6 +1330,7 @@ func (s *OpenAIGatewayService) selectAccountWithScheduler(
 	requiredImageCapability OpenAIImagesCapability,
 	requireCompact bool,
 	platform string,
+	requestSizeBytes int,
 ) (*AccountSelectionResult, OpenAIAccountScheduleDecision, error) {
 	ctx = s.withOpenAIQuotaAutoPauseContext(ctx)
 	platform = normalizeOpenAICompatiblePlatform(platform)
@@ -1367,6 +1416,7 @@ func (s *OpenAIGatewayService) selectAccountWithScheduler(
 		RequiredImageCapability: requiredImageCapability,
 		RequireCompact:          requireCompact,
 		ExcludedIDs:             excludedIDs,
+		RequestSizeBytes:        requestSizeBytes,
 	})
 }
 
